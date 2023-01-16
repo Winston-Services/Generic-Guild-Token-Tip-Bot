@@ -1,5 +1,69 @@
 const fs = require("fs");
 const path = require("path");
+const ethers = require("ethers");
+const ganache = require("ganache");
+const axios = require("axios");
+const blockchainOptions = {
+  chain: {
+    name: "win",
+    symbol: "win",
+    /**
+     * When set to false only one request will be processed at a time. [boolean] [default: true
+     */
+    asyncRequestProcessing: true,
+    chainId: 1001010110
+    // networkId:
+  },
+
+  database: { dbPath: path.resolve(path.join(__dirname, "./data/blockchain")) },
+
+  logging: {
+    /**
+     * Set to true to log EVM opcodes. 
+     */
+    debug: true,
+    /**
+     * Set to true to disable logging. deprecated aliases: --quiet 
+     */
+    quiet: false,
+    /**
+     * Set to true to log detailed RPC requests. deprecated aliases: --verbose
+     */
+    verbose: true
+  },
+
+  miner: {
+    // defaultGasPrice
+    // blockGasLimit
+    // callGasLimit
+    coinbase: "0x7bb2b2201fd7d973addb9d2aa05eef558b07e17b"
+  },
+  wallet: {
+    totalAccounts: 1,
+    // accountKeysPath: path.resolve(path.join(__dirname, "./data/wallets.json")),
+
+    mnemonic:
+      "armed shoulder boring dream witness blue proud smile earth one soap mail", //process.env.mnemonic,
+    defaultBalance: 1000000
+
+    /**
+    * The hierarchical deterministic path to use when generating accounts. [string] [default: m,44',60',0',0]
+    */
+    // hdPath: ""
+  }
+}; // add blockchain settings and storage.
+
+/*
+// we dont need it open to the public so no need to run a server.
+const server = ganache.server(blockchainOptions);
+const PORT = 8545; //move this to .env file
+
+server.listen(PORT, async err => {
+  if (err) throw err;
+
+  console.log(`ganache listening on port ${PORT}...`);
+});
+*/
 //load the configuration file
 const currentFolderPath = path.resolve(path.join(__dirname));
 require("dotenv").config({
@@ -41,8 +105,12 @@ class GenericDiscordBod {
   constructor(params) {
     //load the bots credentials
     this._client = new Client({ partials: _partials, intents: _intents });
+    const ganacheProvider = ganache.provider(blockchainOptions);
+    const web3Provider = new ethers.providers.Web3Provider(ganacheProvider);
+    this._provider = web3Provider;
   }
   login = async () => {
+    this.loadAccountData();
     await this._client.login(options.token);
     //load the event handlers.
     this.loadEventHandlers(currentFolderPath);
@@ -51,8 +119,157 @@ class GenericDiscordBod {
     //start the bot
   };
 
+  _provider;
+  _accounts;
+  get accounts() {
+    const getAccounts = async () => {
+      // console.log(this._provider);
+      return await this._provider.provider.request({
+        method: "eth_accounts",
+        params: []
+      });
+    };
+
+    return getAccounts();
+  }
+
+  async getABI(token, tokenABIFilepath, network = "bsc") {
+    const tokenPath = tokenABIFilepath
+      ? tokenABIFilepath
+      : path.resolve(path.join(__dirname, `./data/tokens/${token}.json`));
+    // console.log(tokenPath);
+    if (!fs.existsSync(tokenPath)) {
+      const config = {
+        scannerAPI:
+          "https://api.bscscan.com/api?module=contract&action=getabi&address={smartContractAddress}&apikey={apiKey}",
+        apiKey: process.env.BSCSCAN_API
+      };
+
+      if (network !== "bsc") {
+        switch (network) {
+          case "eth":
+            config.scannerAPI = "";
+            config.apiKey = ""; // API Key for the explorer
+            break;
+          case "matic":
+            config.scannerAPI = "";
+            config.apiKey = ""; // API Key for the explorer
+            break;
+          default:
+            config.scannerAPI = "http://localhost:5469";
+            config.apiKey = undefined; // API Key for the explorer
+        }
+      }
+
+      const res = await axios
+        .get(
+          config.scannerAPI
+            .replaceAll("{smartContractAddress}", token)
+            .replaceAll("{apiKey}", config.apiKey),
+          {
+            method: "GET",
+            headers: {
+              Accept: "application/json",
+              "Content-Type": "application/json"
+            }
+          }
+        )
+        .then(r => r.data)
+        .catch(error => ({
+          status: 0,
+          message: error
+        }));
+
+      if (res.status === "1" && res.message === "OK") {
+        // console.log(this.abi);
+        fs.writeFileSync(tokenPath, res.result, {
+          encoding: "utf8"
+        });
+        return JSON.parse(res.result);
+      } else {
+        throw Error("ABI Download ERROR :: " + res.message);
+      }
+    } else {
+      return JSON.parse(fs.readFileSync(tokenPath));
+    }
+  }
+
+  async getContract(address) {
+    const abi = await this.getABI(address);
+    return new ethers.Contract(address, abi, this._provider);
+  }
+
+  async contractListener(address, event, cb) {
+    const contract = await getContract(address);
+    return contract.on(event, cb);
+  }
+
+  getGasPrice() {
+    return this._provider.getGasPrice();
+  }
+
+  async send(from, to, amount) {
+    //from should be our signer,
+    //to should be a valid address,
+    //and three should be less than ones balance.
+
+    const tx = await from.sendTransaction({
+      to,
+      value: amount
+    });
+    return tx.wait();
+  }
+
+  set accounts(value) {
+    throw Error("Cannot Set Accounts");
+  }
+  userAccounts = new Map(); // we can use a map for now to store our users in.
+  loadAccountData() {
+    const filePath = path.resolve(path.join(__dirname, "./data/accounts"));
+    if (fs.existsSync(filePath)) {
+      const accountFiles = fs
+        .readdirSync(filePath)
+        .filter(file => file.endsWith(".json"));
+
+      for (const file of accountFiles) {
+        const accountfilePath = path.join(filePath, file);
+        const userObject = require(accountfilePath);
+        const did = file.split(".").shift();
+        this.userAccounts.set(did, userObject);
+      }
+    }
+  }
+  async addAccount(did) {
+    if (this.userAccounts.has(did)) {
+      return this.userAccounts.get(did);
+    } else {
+      const newWallet = ethers.Wallet.createRandom();
+      const formatedNewWallet = {
+        address: await newWallet.getAddress(),
+        privateKey: newWallet.privateKey,
+        mnemonic: newWallet._mnemonic()
+      };
+      this.userAccounts.set(did, formatedNewWallet);
+      this.saveAccount(did, formatedNewWallet);
+      return this.addAccount(did);
+    }
+  }
+
+  saveAccount(did, wallet) {
+    const filePath = path.resolve(path.join(__dirname, "./data/accounts"));
+    try {
+      // console.log(wallet);
+      fs.writeFileSync(
+        path.join(filePath, `${did}.json`),
+        JSON.stringify(JSON.parse(JSON.stringify(wallet)), false, 2)
+      );
+    } catch (error) {
+      console.error(error);
+    }
+  }
+
   //add the slash commands if they have not been added.
-  loadSlashCommands = (currentFolderPath) => {
+  loadSlashCommands = currentFolderPath => {
     console.log("Checking for Slash Commands.");
     const startPath = path.resolve(path.join(currentFolderPath, "commands"));
     if (!fs.existsSync(startPath)) {
@@ -64,7 +281,7 @@ class GenericDiscordBod {
 
     //check the global commands folder.
     if (fs.existsSync(path.join(startPath, "app"))) {
-        console.log("Loading Global Slash Commands.");
+      console.log("Loading Global Slash Commands.");
 
       const commandsPath = path.join(startPath, "app");
       const commandFiles = fs
@@ -78,18 +295,18 @@ class GenericDiscordBod {
       }
     }
 
-    if (fs.existsSync(path.join(startPath, "guild"))) { 
-        console.log("Loading Guild Slash Commands.");
-        const commandsPath = path.join(startPath, "guild");
-        const commandFiles = fs
-          .readdirSync(commandsPath)
-          .filter(file => file.endsWith(".command.js"));
+    if (fs.existsSync(path.join(startPath, "guild"))) {
+      console.log("Loading Guild Slash Commands.");
+      const commandsPath = path.join(startPath, "guild");
+      const commandFiles = fs
+        .readdirSync(commandsPath)
+        .filter(file => file.endsWith(".command.js"));
 
-        for (const file of commandFiles) {
-          const filePath = path.join(commandsPath, file);
-          const command = require(filePath);
-          botCommands.push(command);
-        }
+      for (const file of commandFiles) {
+        const filePath = path.join(commandsPath, file);
+        const command = require(filePath);
+        botCommands.push(command);
+      }
     }
 
     return botCommands;
@@ -126,7 +343,7 @@ class GenericDiscordBod {
       }
       if (interaction.options) {
         try {
-            this.optionBuilder(structuredCommand, interaction.options);
+          this.optionBuilder(structuredCommand, interaction.options);
         } catch (error) {
           console.error(error);
           throw Error("Command Option Initialization Error.");
